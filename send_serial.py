@@ -59,11 +59,30 @@ def send_via_serial(serial_port, header, payload):
 
     ser.write((header + "\n").encode())
     time.sleep(0.1)
-    ser.write(payload)
+
+    # Stream the payload in chunks. ser.write() paces itself at the serial
+    # line rate, so this both avoids buffering the whole file on the device
+    # and drives a progress indicator for large uploads.
+    total = len(payload)
+    sent = 0
+    chunk = 8192
+    show_progress = total > chunk
+    start = time.time()
+    while sent < total:
+        n = ser.write(payload[sent:sent + chunk])
+        sent += n if n else 0
+        if show_progress:
+            elapsed = max(time.time() - start, 0.001)
+            print(f"\r  sent {sent}/{total} bytes ({sent * 100 // total}%)  "
+                  f"{sent / elapsed / 1024:.1f} KB/s", end="", flush=True)
     ser.flush()
+    if show_progress:
+        print()
 
     output = []
-    deadline = time.time() + 130
+    # Big uploads take a while at the serial line rate (~11 KB/s @ 115200),
+    # so scale the wait to the payload size.
+    deadline = time.time() + max(130, total / 8000 + 60)
     while time.time() < deadline:
         line = ser.readline().decode("utf-8", "replace").rstrip("\r\n")
         if line:

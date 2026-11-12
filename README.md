@@ -93,8 +93,11 @@ const char* FTP_USER = "anonymous";
 const char* FTP_PASS = "anonymous@";
 ```
 
-> **Note:** the whole file is buffered in the ESP32's RAM, so uploads are
-> capped at 256 KB. For bigger files you'd need a streaming version.
+> **Note:** the upload is streamed straight from serial to the console, so
+> it's **not** limited by the ESP32's RAM — only by the server's own cap
+> (CivHomebrew allows up to 12 MB) and the firmware's 16 MB guard. Transfers
+> run at the serial line rate (~11 KB/s at 115200 baud), so a multi-MB
+> package takes a few minutes; `send_serial.py` prints a progress line.
 
 ## Serial commands
 

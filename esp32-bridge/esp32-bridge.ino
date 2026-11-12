@@ -95,8 +95,10 @@ void handleHttp() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  // setRxBufferSize must be called before begin() to take effect. A large
+  // RX buffer gives streamed FTP uploads room to breathe during handshakes.
   Serial.setRxBufferSize(65536);
+  Serial.begin(115200);
 
   if (LED_PIN >= 0) {
     pinMode(LED_PIN, OUTPUT);
@@ -214,6 +216,69 @@ uint8_t* readSerialPayload(int payloadLen) {
   return buf;
 }
 
+// Discards up to `n` bytes arriving on the serial port, so the serial
+// stream stays framed if an FTP transfer is aborted before (or part way
+// through) streaming its payload.
+void drainSerialBytes(long n) {
+  if (n <= 0) return;
+  unsigned long idle = millis() + 10000;
+  while (n > 0 && millis() < idle) {
+    if (Serial.available()) {
+      Serial.read();
+      n--;
+      idle = millis() + 2000;
+    } else {
+      delay(1);
+    }
+  }
+}
+
+// Streams exactly `totalLen` bytes from the serial port to an open TCP
+// client in small chunks — nothing is buffered whole, so the upload size
+// is bounded by the server, not by RAM. Keeps the AP's DNS and HTTP
+// responders alive so the Switch doesn't drop the network mid-upload.
+// Returns the number of bytes actually forwarded.
+long streamSerialToClient(WiFiClient& client, long totalLen) {
+  uint8_t chunk[1024];
+  long remaining = totalLen;
+  unsigned long idle = millis() + 15000;
+  unsigned long lastPump = 0;
+
+  while (remaining > 0) {
+    unsigned long now = millis();
+    if (now - lastPump > 100) {
+      dnsServer.processNextRequest();
+      httpServer.handleClient();
+      lastPump = now;
+    }
+
+    int avail = Serial.available();
+    if (avail <= 0) {
+      if (millis() > idle) break;              // serial stalled
+      delay(1);
+      continue;
+    }
+
+    int toRead = avail;
+    if (toRead > (int)sizeof(chunk)) toRead = sizeof(chunk);
+    if (toRead > remaining) toRead = (int)remaining;
+
+    int got = Serial.readBytes(chunk, toRead);
+    if (got <= 0) { if (millis() > idle) break; delay(1); continue; }
+
+    int written = 0;
+    while (written < got) {
+      if (!client.connected()) return totalLen - remaining;   // data conn lost
+      int w = client.write(chunk + written, got - written);
+      if (w > 0) written += w;
+      else delay(1);
+    }
+    remaining -= got;
+    idle = millis() + 15000;
+  }
+  return totalLen - remaining;
+}
+
 // ── Minimal FTP client ──────────────────────────────────────────────
 // Enough to upload one file to the console's FTP server (STOR in binary
 // mode over PASV). The console runs the FTP *server*; the ESP32 is the
@@ -274,20 +339,21 @@ int ftpReadResponse(WiFiClient& ctrl, unsigned long timeoutMs, String& lastLine)
   return -1;
 }
 
-void relayFtp(const char* ip, int port, const char* remotePath,
-              const uint8_t* payload, int len) {
-  Serial.printf("[FTP] Connecting to %s:%d -> %s (%d bytes)...\n",
-                ip, port, remotePath, len);
+void relayFtp(const char* ip, int port, const char* remotePath, long totalLen) {
+  Serial.printf("[FTP] Connecting to %s:%d -> %s (%ld bytes)...\n",
+                ip, port, remotePath, totalLen);
 
   WiFiClient ctrl;
   if (!ctrl.connect(ip, port, 8000)) {
     Serial.println("[FTP] ERROR: control connection failed");
+    drainSerialBytes(totalLen);        // discard the queued payload to resync
     Serial.println("\nEND");
     return;
   }
 
   String resp;
   int code;
+  long consumed = 0;                   // payload bytes pulled from serial so far
 
   code = ftpReadResponse(ctrl, 8000, resp);                 // 220 greeting
   if (code != 220) { Serial.println("[FTP] ERROR: no greeting"); goto fail; }
@@ -346,13 +412,22 @@ void relayFtp(const char* ip, int port, const char* remotePath,
       goto fail;
     }
 
-    data.write(payload, len);
+    // Stream the payload straight from serial to the data connection.
+    // Nothing is buffered whole, so the size is limited by the server
+    // (CivHomebrew caps uploads at 12 MB), not by the ESP32's RAM.
+    Serial.printf("[FTP] Streaming %ld bytes...\n", totalLen);
+    consumed = streamSerialToClient(data, totalLen);
     data.flush();
     data.stop();                                            // closing data -> 226
 
+    if (consumed < totalLen) {
+      Serial.printf("[FTP] ERROR: only streamed %ld of %ld bytes\n", consumed, totalLen);
+      goto fail;
+    }
+
     code = ftpReadResponse(ctrl, 30000, resp);              // 226 transfer complete
     if (code == 226 || code == 250) {
-      Serial.printf("[FTP] OK: uploaded %d bytes to %s\n", len, remotePath);
+      Serial.printf("[FTP] OK: uploaded %ld bytes to %s\n", totalLen, remotePath);
     } else {
       Serial.println("[FTP] ERROR: transfer not confirmed");
     }
@@ -366,6 +441,7 @@ void relayFtp(const char* ip, int port, const char* remotePath,
 
 fail:
   ctrl.stop();
+  drainSerialBytes(totalLen - consumed);   // discard any unstreamed payload
   Serial.println("\nEND");
 }
 
@@ -405,7 +481,7 @@ void processSerialCommand(String& line) {
     }
     String ip = line.substring(i1, i2);
     int port = line.substring(i2 + 1, i3).toInt();
-    int payloadLen = line.substring(i3 + 1, i4).toInt();
+    long payloadLen = line.substring(i3 + 1, i4).toInt();
     String remotePath = line.substring(i4 + 1);
     remotePath.trim();
 
@@ -414,12 +490,14 @@ void processSerialCommand(String& line) {
       Serial.println("\nEND");
       return;
     }
+    if (payloadLen <= 0 || payloadLen > 16L * 1024 * 1024) {
+      Serial.println("[ERROR] Invalid FTP length (1..16 MB)");
+      Serial.println("\nEND");
+      return;
+    }
 
-    uint8_t* buf = readSerialPayload(payloadLen);
-    if (!buf) return;
-
-    relayFtp(ip.c_str(), port, remotePath.c_str(), buf, payloadLen);
-    free(buf);
+    // Streamed straight from serial to the console — not buffered in RAM.
+    relayFtp(ip.c_str(), port, remotePath.c_str(), payloadLen);
 
   } else if (line == "STATUS") {
     Serial.printf("[STATUS] AP clients: %d\n", WiFi.softAPgetStationNum());
