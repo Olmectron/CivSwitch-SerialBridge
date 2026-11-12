@@ -64,13 +64,46 @@ The default TCP port is 9026. You can specify a different one:
 python3 send_serial.py 192.168.4.2 9027 payload.js
 ```
 
+## Upload files over FTP
+
+If the console is running an FTP server (common Switch homebrew: `sys-ftpd`,
+`ftpd` — usually on port 5000, anonymous login), the bridge can upload a file
+to it. The ESP32 acts as the FTP *client* over its own Wi-Fi; your PC just
+streams the file bytes over USB.
+
+```sh
+# upload file.bin to /switch/payload.bin on the console (FTP port 5000)
+python3 send_serial.py --ftp /switch/payload.bin 192.168.4.2 file.bin
+
+# pick a different FTP port
+python3 send_serial.py --ftp /uploads/app.nro 192.168.4.2 5001 app.nro
+
+# Windows, explicit serial port
+python3 send_serial.py --port COM3 --ftp /switch/payload.bin 192.168.4.2 file.bin
+```
+
+The ESP32 logs the FTP conversation over serial (`[FTP>]` sent, `[FTP<]`
+received) and prints `[FTP] OK: uploaded N bytes ...` on success.
+
+FTP login defaults to anonymous. If your server needs real credentials, edit
+these near the top of the `.ino`:
+
+```c
+const char* FTP_USER = "anonymous";
+const char* FTP_PASS = "anonymous@";
+```
+
+> **Note:** the whole file is buffered in the ESP32's RAM, so uploads are
+> capped at 256 KB. For bigger files you'd need a streaming version.
+
 ## Serial commands
 
 You can also talk to the ESP32 directly over serial (115200 baud):
 
 | Command | What it does |
 |---------|-------------|
-| `SEND <ip> <port> <len>` | Relay a payload (followed by `<len>` bytes of data) |
+| `SEND <ip> <port> <len>` | Relay a payload to the TCP loader (followed by `<len>` bytes of data) |
+| `FTP <ip> <port> <len> <remote_path>` | Upload `<len>` bytes (sent right after the line) to `<remote_path>` on the console's FTP server |
 | `STATUS` | Show number of connected clients |
 | `SCAN` | List connected clients by MAC address |
 

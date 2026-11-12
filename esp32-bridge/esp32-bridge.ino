@@ -10,6 +10,7 @@
  *
  * Serial protocol:
  *   PC sends:     SEND <ip> <port> <length>\n<payload bytes>
+ *   PC sends:     FTP <ip> <port> <length> <remote_path>\n<file bytes>
  *   ESP32 replies: console response, then \nEND\n
  *   Other commands: STATUS, SCAN
  *
@@ -36,6 +37,13 @@ IPAddress subnet(255, 255, 255, 0);
 // Built-in LED pin. GPIO 2 on most boards.
 // Set to -1 if your board doesn't have one or you don't care.
 const int LED_PIN = 2;
+
+// ── FTP relay config ────────────────────────────────────────────────
+// Credentials used when uploading to the console's FTP server.
+// Most Switch homebrew FTP servers (sys-ftpd, ftpd) accept anonymous
+// login. Change these if your server requires real credentials.
+const char* FTP_USER = "anonymous";
+const char* FTP_PASS = "anonymous@";
 
 // ── DNS + HTTP (makes the Switch accept the network) ────────────────
 DNSServer dnsServer;
@@ -170,6 +178,197 @@ void relayPayload(const char* ip, int port, const uint8_t* payload, int len) {
   Serial.println("\nEND");
 }
 
+// Reads `payloadLen` bytes from the serial port into a freshly malloc'd
+// buffer. On any error it prints the error + END and returns NULL, so the
+// caller just checks for NULL and bails. Caller must free() on success.
+uint8_t* readSerialPayload(int payloadLen) {
+  if (payloadLen <= 0 || payloadLen > 262144) {
+    Serial.println("[ERROR] Invalid payload length");
+    Serial.println("\nEND");
+    return NULL;
+  }
+
+  uint8_t* buf = (uint8_t*)malloc(payloadLen);
+  if (!buf) {
+    Serial.println("[ERROR] Out of memory");
+    Serial.println("\nEND");
+    return NULL;
+  }
+
+  int received = 0;
+  unsigned long timeout = millis() + 10000;
+  while (received < payloadLen && millis() < timeout) {
+    if (Serial.available()) {
+      buf[received++] = Serial.read();
+      timeout = millis() + 5000;
+    }
+  }
+
+  if (received < payloadLen) {
+    Serial.printf("[ERROR] Only got %d of %d bytes\n", received, payloadLen);
+    Serial.println("\nEND");
+    free(buf);
+    return NULL;
+  }
+
+  return buf;
+}
+
+// ── Minimal FTP client ──────────────────────────────────────────────
+// Enough to upload one file to the console's FTP server (STOR in binary
+// mode over PASV). The console runs the FTP *server*; the ESP32 is the
+// client, on its own Wi-Fi network.
+
+void ftpSendCmd(WiFiClient& ctrl, const String& cmd) {
+  Serial.print("[FTP>] ");
+  Serial.println(cmd);
+  ctrl.print(cmd);
+  ctrl.print("\r\n");
+  ctrl.flush();
+}
+
+// Reads one complete FTP control reply (handling multi-line replies),
+// echoes each line over serial, stores the final line in `lastLine`,
+// and returns the 3-digit status code (or -1 on timeout).
+int ftpReadResponse(WiFiClient& ctrl, unsigned long timeoutMs, String& lastLine) {
+  unsigned long deadline = millis() + timeoutMs;
+  String line = "";
+  bool multiline = false;
+  String multiCode = "";
+
+  while (millis() < deadline) {
+    while (ctrl.available()) {
+      char c = ctrl.read();
+      deadline = millis() + timeoutMs;
+      if (c == '\n') {
+        line.trim();
+        Serial.print("[FTP<] ");
+        Serial.println(line);
+        bool hasCode = line.length() >= 4 &&
+                       line[0] >= '0' && line[0] <= '9' &&
+                       line[1] >= '0' && line[1] <= '9' &&
+                       line[2] >= '0' && line[2] <= '9';
+        if (hasCode) {
+          String codeStr = line.substring(0, 3);
+          char sep = line.charAt(3);
+          if (!multiline) {
+            if (sep == '-') {            // start of multi-line reply
+              multiline = true;
+              multiCode = codeStr;
+            } else {                     // single-line reply: done
+              lastLine = line;
+              return codeStr.toInt();
+            }
+          } else if (codeStr == multiCode && sep == ' ') {
+            lastLine = line;             // terminating line of multi-line reply
+            return codeStr.toInt();
+          }
+        }
+        line = "";
+      } else if (c != '\r') {
+        line += c;
+      }
+    }
+    delay(5);
+  }
+  return -1;
+}
+
+void relayFtp(const char* ip, int port, const char* remotePath,
+              const uint8_t* payload, int len) {
+  Serial.printf("[FTP] Connecting to %s:%d -> %s (%d bytes)...\n",
+                ip, port, remotePath, len);
+
+  WiFiClient ctrl;
+  if (!ctrl.connect(ip, port, 8000)) {
+    Serial.println("[FTP] ERROR: control connection failed");
+    Serial.println("\nEND");
+    return;
+  }
+
+  String resp;
+  int code;
+
+  code = ftpReadResponse(ctrl, 8000, resp);                 // 220 greeting
+  if (code != 220) { Serial.println("[FTP] ERROR: no greeting"); goto fail; }
+
+  ftpSendCmd(ctrl, String("USER ") + FTP_USER);
+  code = ftpReadResponse(ctrl, 8000, resp);                 // 331 or 230
+  if (code == 331) {
+    ftpSendCmd(ctrl, String("PASS ") + FTP_PASS);
+    code = ftpReadResponse(ctrl, 8000, resp);               // 230
+  }
+  if (code != 230) { Serial.println("[FTP] ERROR: login failed"); goto fail; }
+
+  ftpSendCmd(ctrl, "TYPE I");                               // binary mode
+  code = ftpReadResponse(ctrl, 8000, resp);                 // 200
+  if (code != 200) { Serial.println("[FTP] ERROR: TYPE I rejected"); goto fail; }
+
+  ftpSendCmd(ctrl, "PASV");                                 // passive mode
+  code = ftpReadResponse(ctrl, 8000, resp);                 // 227 (h1,h2,h3,h4,p1,p2)
+  if (code != 227) { Serial.println("[FTP] ERROR: PASV rejected"); goto fail; }
+
+  {
+    int open = resp.indexOf('(');
+    int close = resp.indexOf(')', open);
+    if (open < 0 || close < 0) {
+      Serial.println("[FTP] ERROR: can't parse PASV reply");
+      goto fail;
+    }
+    String nums = resp.substring(open + 1, close);
+    int vals[6];
+    int n = 0, start = 0;
+    for (int i = 0; i <= nums.length() && n < 6; i++) {
+      if (i == nums.length() || nums[i] == ',') {
+        vals[n++] = nums.substring(start, i).toInt();
+        start = i + 1;
+      }
+    }
+    if (n != 6) {
+      Serial.println("[FTP] ERROR: bad PASV reply");
+      goto fail;
+    }
+    String dataIp = String(vals[0]) + "." + vals[1] + "." + vals[2] + "." + vals[3];
+    int dataPort = vals[4] * 256 + vals[5];
+    Serial.printf("[FTP] Data channel %s:%d\n", dataIp.c_str(), dataPort);
+
+    WiFiClient data;
+    if (!data.connect(dataIp.c_str(), dataPort, 8000)) {
+      Serial.println("[FTP] ERROR: data connection failed");
+      goto fail;
+    }
+
+    ftpSendCmd(ctrl, String("STOR ") + remotePath);
+    code = ftpReadResponse(ctrl, 8000, resp);               // 150 or 125
+    if (code != 150 && code != 125) {
+      Serial.println("[FTP] ERROR: STOR rejected");
+      data.stop();
+      goto fail;
+    }
+
+    data.write(payload, len);
+    data.flush();
+    data.stop();                                            // closing data -> 226
+
+    code = ftpReadResponse(ctrl, 30000, resp);              // 226 transfer complete
+    if (code == 226 || code == 250) {
+      Serial.printf("[FTP] OK: uploaded %d bytes to %s\n", len, remotePath);
+    } else {
+      Serial.println("[FTP] ERROR: transfer not confirmed");
+    }
+  }
+
+  ftpSendCmd(ctrl, "QUIT");
+  ftpReadResponse(ctrl, 3000, resp);
+  ctrl.stop();
+  Serial.println("\nEND");
+  return;
+
+fail:
+  ctrl.stop();
+  Serial.println("\nEND");
+}
+
 void processSerialCommand(String& line) {
   line.trim();
   if (line.startsWith("SEND ")) {
@@ -185,36 +384,41 @@ void processSerialCommand(String& line) {
     int port = line.substring(i2 + 1, i3).toInt();
     int payloadLen = line.substring(i3 + 1).toInt();
 
-    if (payloadLen <= 0 || payloadLen > 262144) {
-      Serial.println("[ERROR] Invalid payload length");
-      Serial.println("\nEND");
-      return;
-    }
-
-    uint8_t* buf = (uint8_t*)malloc(payloadLen);
-    if (!buf) {
-      Serial.println("[ERROR] Out of memory");
-      Serial.println("\nEND");
-      return;
-    }
-
-    int received = 0;
-    unsigned long timeout = millis() + 10000;
-    while (received < payloadLen && millis() < timeout) {
-      if (Serial.available()) {
-        buf[received++] = Serial.read();
-        timeout = millis() + 5000;
-      }
-    }
-
-    if (received < payloadLen) {
-      Serial.printf("[ERROR] Only got %d of %d bytes\n", received, payloadLen);
-      Serial.println("\nEND");
-      free(buf);
-      return;
-    }
+    uint8_t* buf = readSerialPayload(payloadLen);
+    if (!buf) return;
 
     relayPayload(ip.c_str(), port, buf, payloadLen);
+    free(buf);
+
+  } else if (line.startsWith("FTP ")) {
+    // FTP <ip> <port> <length> <remote_path>
+    // Uploads <length> bytes (sent right after this line) to <remote_path>
+    // on the console's FTP server via STOR, binary mode, passive.
+    int i1 = 4;
+    int i2 = line.indexOf(' ', i1);
+    int i3 = line.indexOf(' ', i2 + 1);
+    int i4 = line.indexOf(' ', i3 + 1);
+    if (i2 < 0 || i3 < 0 || i4 < 0) {
+      Serial.println("[ERROR] Usage: FTP <ip> <port> <length> <remote_path>");
+      Serial.println("\nEND");
+      return;
+    }
+    String ip = line.substring(i1, i2);
+    int port = line.substring(i2 + 1, i3).toInt();
+    int payloadLen = line.substring(i3 + 1, i4).toInt();
+    String remotePath = line.substring(i4 + 1);
+    remotePath.trim();
+
+    if (remotePath.length() == 0) {
+      Serial.println("[ERROR] FTP needs a remote path");
+      Serial.println("\nEND");
+      return;
+    }
+
+    uint8_t* buf = readSerialPayload(payloadLen);
+    if (!buf) return;
+
+    relayFtp(ip.c_str(), port, remotePath.c_str(), buf, payloadLen);
     free(buf);
 
   } else if (line == "STATUS") {
@@ -234,7 +438,7 @@ void processSerialCommand(String& line) {
     Serial.println("\nEND");
 
   } else if (line.length() > 0) {
-    Serial.println("[ERROR] Unknown command. Use: SEND, STATUS, SCAN");
+    Serial.println("[ERROR] Unknown command. Use: SEND, FTP, STATUS, SCAN");
     Serial.println("\nEND");
   }
 }
