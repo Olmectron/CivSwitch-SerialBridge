@@ -99,6 +99,25 @@ const char* FTP_PASS = "anonymous@";
 > run at the serial line rate (~11 KB/s at 115200 baud), so a multi-MB
 > package takes a few minutes; `send_serial.py` prints a progress line.
 
+### FTP targets seen in the wild
+
+The bridge's FTP client is a standard client (anonymous login, binary,
+passive), so it works with the FTP servers these environments run. Only the
+port changes:
+
+| Environment | FTP server | Port |
+|---|---|---|
+| CivHomebrew | built-in package inbox | 5000 |
+| kaiHEN (Switch 2) | **OunceShell** (`ounceshell.nro`, ftpvita) | **1337** |
+
+The ESP32 firmware needs no change for either — just pass the right port. For
+kaiHEN's OunceShell (launch it from hbmenu first so its FTP server is up):
+
+```sh
+# upload homebrew.nro to the SD root via OunceShell's FTP (port 1337)
+python3 send_serial.py --port COM8 --ftp /homebrew.nro 192.168.4.2 1337 homebrew.nro
+```
+
 ## Serial commands
 
 You can also talk to the ESP32 directly over serial (115200 baud):
